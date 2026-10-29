@@ -1,0 +1,18 @@
+FFmpeg in this package
+======================
+
+ffmpeg.exe and ffprobe.exe are an unmodified LGPL build from BtbN/FFmpeg-Builds
+(variant win64-lgpl, configured with --enable-version3, so LGPL v3 applies).
+
+Version:        N-128198-g37515cfd87-20261029
+FFmpeg source:  https://github.com/FFmpeg/FFmpeg/tree/37515cfd87
+Build scripts:  https://github.com/BtbN/FFmpeg-Builds
+Release:        https://github.com/BtbN/FFmpeg-Builds/releases
+
+The license text is in ffmpeg-LICENSE.txt. vot-local runs ffmpeg.exe and ffprobe.exe
+as separate programs and does not link against them; you may replace both files
+with any other FFmpeg build.
+
+If the links above stop working, the corresponding source code is available on
+request for three years from the date of this release: open an issue at
+https://github.com/AlexGromer/vot-local/issues.

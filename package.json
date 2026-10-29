@@ -1,0 +1,25 @@
+{
+  "name": "vot-local",
+  "version": "0.1.0",
+  "description": "Translate local video files with Yandex voice-over translation and get a .mkv with a dubbed audio track",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test",
+    "check": "tsc --noEmit",
+    "lint": "biome check src tests scripts",
+    "e2e": "bun scripts/e2e.ts",
+    "package:windows": "bun scripts/package-windows.ts"
+  },
+  "dependencies": {
+    "@vot.js/node": "^3.2.0",
+    "@vot.js/shared": "^3.2.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.4",
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}
