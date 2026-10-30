@@ -1,23 +1,28 @@
 import { rmSync } from "node:fs";
 import { copyFile, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import VOTClient, { VOTTypes } from "@vot.js/node";
 import pkg from "../package.json";
 import { cleanupOnSignals, errorMessage, onCleanup } from "./cleanup";
-import { HELP, parseCommand, type TranslateOptions } from "./cli";
+import { HELP, parseCommand, shouldPause, type TranslateOptions } from "./cli";
 import { useUtf8Console } from "./console";
 import { extractAudioArgs, probe } from "./media";
-import { isSubtitleError, muxArgs, outputPath } from "./mux";
+import { firstAttempt, muxArgs, outputPath, retryAttempt } from "./mux";
 import { findTool, ProcessError, run } from "./process";
-import { installCommands, uninstallCommands } from "./registry";
+import {
+  encodeRegFile,
+  findPotPlayer,
+  installRegFile,
+  uninstallRegFile,
+} from "./registry";
 import { serveFile } from "./server";
 import { type TranslateFn, waitForTranslation } from "./translate";
 import { openTunnel, waitReachable } from "./tunnel";
 
 const NO_ARGS_HINT = `VOT-local переводит видео с компьютера.
-Чтобы добавить пункт «Перевести (VOT)» в меню видеофайлов, запустите install.cmd.
-Потом нажмите правой кнопкой на видео и выберите «Перевести (VOT)».`;
+Чтобы добавить подменю «VOT: закадровый перевод» в меню видеофайлов, запустите install.cmd.
+Потом нажмите правой кнопкой на видео и выберите нужный пункт.`;
 
 function say(message: string) {
   console.log(message);
@@ -69,14 +74,42 @@ async function download(url: string, target: string) {
   }
 }
 
-async function mux(base: Omit<Parameters<typeof muxArgs>[0], "withSubtitles">) {
-  try {
-    await run(muxArgs({ ...base, withSubtitles: true }));
-  } catch (err) {
-    if (!(err instanceof ProcessError) || !isSubtitleError(err.stderr)) {
-      throw err;
+type MuxBase = Omit<
+  Parameters<typeof muxArgs>[0],
+  "withSubtitles" | "reencodeVideo"
+>;
+
+async function mux(base: MuxBase, mp4SafeVideo: boolean) {
+  let attempt = firstAttempt(base.format, mp4SafeVideo);
+  for (;;) {
+    try {
+      await run(muxArgs({ ...base, ...attempt }));
+      return;
+    } catch (err) {
+      const next =
+        err instanceof ProcessError
+          ? retryAttempt(base.format, attempt, err.stderr)
+          : null;
+      if (!next) {
+        throw err;
+      }
+      attempt = next;
     }
-    await run(muxArgs({ ...base, withSubtitles: false }));
+  }
+}
+
+function openResult(file: string, openWith: string | undefined): boolean {
+  const cmd = openWith
+    ? [openWith, file]
+    : process.platform === "win32"
+      ? ["explorer.exe", file]
+      : ["xdg-open", file];
+  try {
+    Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" }).unref();
+    return true;
+  } catch (err) {
+    say(`Не удалось открыть результат: ${errorMessage(err)}`);
+    return false;
   }
 }
 
@@ -91,7 +124,7 @@ async function translateFile(file: string, options: TranslateOptions) {
     throw new Error("В файле нет звуковой дорожки, переводить нечего");
   }
 
-  const output = outputPath(file, options.responseLang);
+  const output = outputPath(file, options.responseLang, options.format);
   const part = `${output}.part`;
   try {
     await writeFile(part, "");
@@ -152,21 +185,38 @@ async function translateFile(file: string, options: TranslateOptions) {
     await download(translationUrl, translation);
 
     say("Собираю видео с переводом…");
-    await mux({
-      ffmpeg,
-      video: file,
-      translation,
-      output: part,
-      responseLang: options.responseLang,
-      originalVolume: options.originalVolume,
-    });
+    await mux(
+      {
+        ffmpeg,
+        video: file,
+        translation,
+        output: part,
+        format: options.format,
+        responseLang: options.responseLang,
+        originalVolume: options.originalVolume,
+      },
+      info.mp4SafeVideo,
+    );
     await rename(part, output);
     forgetPart();
 
     if (options.keepAudio) {
-      await copyFile(translation, output.replace(/\.mkv$/, ".mp3"));
+      const mp3 = `${output.slice(0, -extname(output).length)}.mp3`;
+      await copyFile(translation, mp3);
     }
     say(`Готово: ${output}`);
+    if (options.resultFile) {
+      await writeFile(options.resultFile, output, "utf8").catch(
+        (err: unknown) =>
+          say(`Не удалось записать --result-file: ${errorMessage(err)}`),
+      );
+    }
+    if (
+      (options.open || options.openWith) &&
+      !openResult(output, options.openWith)
+    ) {
+      throw new Error(`Перевод сохранён, но открыть его не удалось: ${output}`);
+    }
   } finally {
     await rm(tmp, {
       recursive: true,
@@ -180,21 +230,23 @@ async function translateFile(file: string, options: TranslateOptions) {
   }
 }
 
-async function runRegistry(commands: string[][], done: string) {
+async function importRegistry(content: string) {
   if (process.platform !== "win32") {
     throw new Error("Пункт меню можно добавить только в Windows");
   }
   if (basename(process.execPath).toLowerCase() !== "vot-local.exe") {
     throw new Error("Запустите install.cmd из папки VOT-local");
   }
-  for (const cmd of commands) {
-    await run(cmd).catch((err: unknown) => {
-      if (cmd[1] !== "delete") {
-        throw new Error(`Не удалось изменить меню: ${errorMessage(err)}`);
-      }
-    });
+  const tmp = await mkdtemp(join(tmpdir(), "vot-local-reg-"));
+  try {
+    const file = join(tmp, "menu.reg");
+    await writeFile(file, encodeRegFile(content));
+    await run(["reg", "import", file]);
+  } catch (err) {
+    throw new Error(`Не удалось изменить меню: ${errorMessage(err)}`);
+  } finally {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
-  say(done);
 }
 
 async function main(): Promise<number> {
@@ -215,17 +267,22 @@ async function main(): Promise<number> {
       case "version":
         say(pkg.version);
         break;
-      case "install":
-        await runRegistry(
-          installCommands(process.execPath),
-          "Пункт «Перевести (VOT)» добавлен в меню видеофайлов",
+      case "install": {
+        const potplayer = command.potplayer ?? findPotPlayer();
+        await importRegistry(installRegFile(process.execPath, potplayer));
+        say("Подменю «VOT: закадровый перевод» добавлено в меню видеофайлов");
+        say(
+          potplayer
+            ? `PotPlayer найден: ${potplayer}`
+            : "PotPlayer не найден, пункт для него не добавлен",
         );
         break;
+      }
       case "uninstall":
-        await runRegistry(uninstallCommands(), "Пункт меню удалён");
+        await importRegistry(uninstallRegFile());
+        say("Подменю удалено");
         break;
       case "translate":
-        pause = command.options.pause;
         for (const file of command.files) {
           try {
             await translateFile(file, command.options);
@@ -234,10 +291,12 @@ async function main(): Promise<number> {
             say(`Ошибка (${basename(file)}): ${friendlyError(err)}`);
           }
         }
+        pause = shouldPause(command.options, failed);
         break;
     }
   } catch (err) {
     failed++;
+    pause ||= argv.includes("--pause-on-error");
     say(`Ошибка: ${friendlyError(err)}`);
   }
 
