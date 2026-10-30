@@ -87,6 +87,12 @@ for (const file of [...tools, ...vendorLicenses]) {
     throw new Error(`missing vendor/windows/${file}`);
   }
 }
+const aimpPack = join(root, "dist", "aimp", "vot_local.aimppack");
+if (!existsSync(aimpPack)) {
+  throw new Error(
+    "missing dist/aimp/vot_local.aimppack: run scripts/build-aimp.ts",
+  );
+}
 
 await rm(out, { recursive: true, force: true });
 await rm(zip, { force: true });
@@ -124,6 +130,8 @@ await writeFile(
   join(out, "README.txt"),
   windowsText(await Bun.file(join(root, "docs", "README-RU.txt")).text()),
 );
+await mkdir(join(out, "plugins"), { recursive: true });
+await copyFile(aimpPack, join(out, "plugins", "vot_local.aimppack"));
 await writeFile(join(out, "install.cmd"), installCmd.replaceAll("\n", "\r\n"));
 await writeFile(
   join(out, "uninstall.cmd"),
